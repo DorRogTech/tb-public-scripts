@@ -2183,6 +2183,38 @@
 
 
 
+
+// Opt-in initial-record support. Existing calls without initialRecord keep their behavior.
+// Keying by the original textarea avoids retaining removed Tadabase components.
+var ROG_QUILL_RECORD_MOUNTS = new WeakMap();
+
+function ROG_quillSetInitialHTML(quill, html) {
+  if (!html) {
+    quill.setText('', Quill.sources.SILENT);
+    return;
+  }
+  // Quill 2 changed clipboard.convert() to accept an object.
+  const version = parseInt(String(Quill.version || '1').split('.')[0], 10);
+  const delta = version >= 2
+    ? quill.clipboard.convert({ html: html, text: '' })
+    : quill.clipboard.convert(html);
+  quill.setContents(delta, Quill.sources.SILENT);
+}
+
+function ROG_quillHasMeaningfulHTML(html) {
+  if (!html) return false;
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  return Boolean(
+    (template.content.textContent || '').replace(/[\s\u00a0\u200b]/g, '') ||
+    template.content.querySelector('img,video,iframe,svg,table,hr')
+  );
+}
+
+function ROG_quillInitialLoadFailed(quill, html) {
+  return ROG_quillHasMeaningfulHTML(html) && quill.getLength() <= 1;
+}
+
 var ROG_renderQuill = (componentId, arrayOfFields, opts = {}) => {
 
   const {
@@ -2190,6 +2222,9 @@ var ROG_renderQuill = (componentId, arrayOfFields, opts = {}) => {
     root = document,      // e.g., data.ele
 
     delay = 50,           // match your original setTimeout
+
+    // Optional. When supplied, data.record is authoritative for initial HTML.
+    initialRecord = null,
 
 
 
@@ -2244,6 +2279,7 @@ var ROG_renderQuill = (componentId, arrayOfFields, opts = {}) => {
 
 
   const editors = {}; // { [rawId: string]: Quill }
+  const useInitialRecord = initialRecord !== null && typeof initialRecord === 'object';
 
 
 
@@ -2343,35 +2379,101 @@ var ROG_renderQuill = (componentId, arrayOfFields, opts = {}) => {
 
 
 
-      // Prefer TinyMCE content if present
 
-      let initialValue = '';
+      // Opt-in path: TB.render data.record is the source for the initial HTML.
+      // A present but empty field is authoritative and must remain empty.
+      const hasRecordValue = useInitialRecord &&
+        Object.prototype.hasOwnProperty.call(initialRecord, rawId);
+      const recordValue = hasRecordValue
+        ? (initialRecord[rawId] == null ? '' : String(initialRecord[rawId]))
+        : null;
+      const recordKey = useInitialRecord
+        ? (initialRecord.id != null ? String(initialRecord.id) :
+           initialRecord.recordId != null ? String(initialRecord.recordId) : null)
+        : null;
 
-      try {
+      // TB.render can fire again on the same live textarea. Reuse its Quill
+      // instance, and never overwrite text already edited by the user.
+      if (useInitialRecord) {
+        const previous = ROG_QUILL_RECORD_MOUNTS.get($textarea[0]);
+        if (previous && previous.quill && previous.quill.root &&
+            previous.quill.root.isConnected) {
+          const recordChanged = recordKey !== null &&
+            previous.recordKey !== null && recordKey !== previous.recordKey;
+          const sourceChanged = hasRecordValue &&
+            recordValue !== previous.initialValue;
 
-        if (window.tinyMCE && tinyMCE.get(richTextId)) {
-
-          initialValue = tinyMCE.get(richTextId).getContent() || '';
-
-        } else {
-
-          initialValue = $textarea.val() || '';
-
+          if (previous.dirty &&
+              (recordChanged || (recordKey === null && sourceChanged))) {
+            previous.conflict = true;
+            console.error('[ROG_renderQuill] Record data changed with unsaved edits:', rawId);
+          } else if (recordChanged && !hasRecordValue) {
+            // The record changed but its field was not supplied; never reuse
+            // the old record's HTML as a value for the new record.
+            previous.conflict = true;
+            console.error('[ROG_renderQuill] New record has no field value:', rawId);
+          } else if (hasRecordValue && !previous.dirty &&
+                     (recordChanged || recordValue !== previous.initialValue)) {
+            const oldContents = previous.quill.getContents();
+            try {
+              ROG_quillSetInitialHTML(previous.quill, recordValue);
+              if (ROG_quillInitialLoadFailed(previous.quill, recordValue)) {
+                throw new Error('Record HTML could not be rendered');
+              }
+              $textarea.val(recordValue);
+              previous.initialValue = recordValue;
+              previous.recordKey = recordKey;
+              previous.conflict = false;
+            } catch (e) {
+              previous.quill.setContents(oldContents, Quill.sources.SILENT);
+              previous.conflict = true;
+              console.error('[ROG_renderQuill] Rehydrate failed:', rawId, e);
+            }
+          }
+          editors[rawId] = previous.quill;
+          return;
         }
-
-      } catch (e) {
-
-        console.warn('ROG_renderQuill3: TinyMCE read failed, fallback to textarea', e);
-
-        initialValue = $textarea.val() || '';
-
       }
 
-
+      let initialValue = '';
+      if (hasRecordValue) {
+        initialValue = recordValue;
+      } else if (useInitialRecord) {
+        // An older form or a field missing from data.record can still fall back.
+        const textareaValue = $textarea.val() || '';
+        let tinyValue = '';
+        try {
+          if (window.tinyMCE && tinyMCE.get(richTextId)) {
+            tinyValue = tinyMCE.get(richTextId).getContent() || '';
+          }
+        } catch (e) {
+          console.warn('[ROG_renderQuill] TinyMCE fallback read failed', e);
+        }
+        initialValue = textareaValue || tinyValue;
+      } else {
+        // Legacy path is intentionally unchanged for all existing callers.
+        try {
+          if (window.tinyMCE && tinyMCE.get(richTextId)) {
+            initialValue = tinyMCE.get(richTextId).getContent() || '';
+          } else {
+            initialValue = $textarea.val() || '';
+          }
+        } catch (e) {
+          console.warn('ROG_renderQuill3: TinyMCE read failed, fallback to textarea', e);
+          initialValue = $textarea.val() || '';
+        }
+      }
 
       // Inject Quill host; hide TinyMCE chrome if present
 
       const editorId = `${componentId}_editor_${richTextId}`;
+
+      // Avoid a duplicate host if another caller already mounted Quill here
+      // without using the opt-in instance registry.
+      if (useInitialRecord && document.getElementById(editorId)) {
+        console.warn('[ROG_renderQuill] Existing untracked Quill host:', editorId);
+        return;
+      }
 
       const hostHtml = `<div id="${editorId}" dir="rtl" style="text-align:right;"></div>`;
 
@@ -2515,17 +2617,55 @@ var ROG_renderQuill = (componentId, arrayOfFields, opts = {}) => {
 
 
 
-      // Load initial HTML
 
-      if (initialValue) {
-
+      // Load HTML once. The opt-in path handles Quill 1/2 and validates that
+      // non-empty record data did not silently render as an empty editor.
+      if (useInitialRecord) {
+        try {
+          ROG_quillSetInitialHTML(quill, initialValue);
+          if (hasRecordValue && ROG_quillInitialLoadFailed(quill, initialValue)) {
+            throw new Error('The existing record HTML rendered as empty');
+          }
+          if (hasRecordValue || initialValue) $textarea.val(initialValue);
+        } catch (e) {
+          console.error('[ROG_renderQuill] Initial HTML load failed:', rawId, e);
+          // Fail open: remove the Quill host so the native Tadabase editor is
+          // available instead of exposing a blank editor that may overwrite data.
+          const host = document.getElementById(editorId);
+          if (host) host.remove();
+          // Restore the authoritative source into Tadabase's native field,
+          // so even the fallback editor cannot save a stale empty value.
+          if (hasRecordValue) {
+            $textarea.val(initialValue);
+            try {
+              const nativeTiny = window.tinyMCE && tinyMCE.get(richTextId);
+              if (nativeTiny) nativeTiny.setContent(initialValue);
+            } catch (nativeError) {
+              console.warn('[ROG_renderQuill] Native fallback sync failed', nativeError);
+            }
+          }
+          const $nativeEditor = jQuery('.mce-tinymce, .tox-tinymce', $formGroup);
+          if ($nativeEditor.length) $nativeEditor.show();
+          else $textarea.show();
+          if (window.TB && typeof TB.showAlert === 'function') {
+            TB.showAlert('לא ניתן להציג את תוכן השדה. נא לרענן את הטופס.', 'error');
+          }
+          return;
+        }
+      } else if (initialValue) {
+        // Legacy behavior, unchanged.
         quill.setContents(quill.clipboard.convert(initialValue));
-
         $textarea.val(initialValue);
-
       }
 
-
+      const mountState = useInitialRecord ? {
+        quill: quill,
+        recordKey: recordKey,
+        initialValue: hasRecordValue ? recordValue : null,
+        dirty: false,
+        conflict: false
+      } : null;
+      if (mountState) ROG_QUILL_RECORD_MOUNTS.set($textarea[0], mountState);
 
       // Angular sync helper (safe no-op if Angular absent)
 
@@ -2585,7 +2725,9 @@ var ROG_renderQuill = (componentId, arrayOfFields, opts = {}) => {
 
       // the new <img> reaches the textarea. Do not change those to 'silent'.
 
-      quill.on('text-change', function () {
+      quill.on('text-change', function (delta, oldDelta, source) {
+
+        if (mountState && source === Quill.sources.USER) mountState.dirty = true;
 
         const html = quill.root.innerHTML;
 
@@ -2652,6 +2794,36 @@ var ROG_renderQuill = (componentId, arrayOfFields, opts = {}) => {
       });
 
 
+
+
+      // Only opt-in record-backed editors need conflict protection.
+      // Capture events before Tadabase's own submit handlers run.
+      if (mountState) {
+        const blockConflictedSave = function (e) {
+          if (!mountState.conflict) return;
+          e.preventDefault();
+          e.stopPropagation();
+          if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+          if (window.TB && typeof TB.showAlert === 'function') {
+            TB.showAlert('הרשומה השתנתה בזמן העריכה. נא לרענן לפני שמירה.', 'error');
+          } else {
+            window.alert('הרשומה השתנתה בזמן העריכה. נא לרענן לפני שמירה.');
+          }
+        };
+        const $form = $textarea.closest('form');
+        if ($form.length) {
+          $form[0].addEventListener('click', function (e) {
+            if (e.target.closest && e.target.closest('.af-form-submit')) {
+              blockConflictedSave(e);
+            }
+          }, true);
+          $form[0].addEventListener('submit', blockConflictedSave, true);
+        } else {
+          jQuery('.af-form-submit', $searchRoot).each(function () {
+            this.addEventListener('click', blockConflictedSave, true);
+          });
+        }
+      }
 
       // Enforce RTL/right align after init
 
