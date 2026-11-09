@@ -2,8 +2,26 @@
 (function (global) {
 
   'use strict';
-
-
+  
+  // ROG Quill - Automatically hide TinyMCE
+  // =====================================================
+  
+  (function () {
+    if (document.getElementById('rog-quill-hide-tinymce')) return;
+  
+    const style = document.createElement('style');
+    style.id = 'rog-quill-hide-tinymce';
+  
+    style.textContent = `
+      .form-group:has(.ql-container) .mce-tinymce,
+      .form-group:has(.ql-container) .tox-tinymce,
+      .form-group:has(.ql-container) textarea {
+        display: none !important;
+      }
+    `;
+  
+    (document.head || document.documentElement).appendChild(style);
+  })();
 
   // ==========================================================================
 
